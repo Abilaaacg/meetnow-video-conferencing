@@ -16,7 +16,6 @@ export default function MeetingRoom() {
   const [connected, setConnected] = useState(false)
   const [meetingJoined, setMeetingJoined] = useState(false)
   const [joinError, setJoinError] = useState('')
-  const [meetingEnded, setMeetingEnded] = useState(false)
 
   const [audioEnabled, setAudioEnabled] = useState(true)
   const [videoEnabled, setVideoEnabled] = useState(true)
@@ -46,6 +45,7 @@ export default function MeetingRoom() {
   const myPeerIdRef = useRef(null)
   const chatEndRef = useRef(null)
   const timerRef = useRef(null)
+  const isHostRef = useRef(false)
 
   const showNotif = useCallback((msg, type = 'info') => {
     setNotification({ msg, type })
@@ -115,7 +115,6 @@ export default function MeetingRoom() {
           ))
           break
         case 'welcome': {
-          // Host sent us the list of existing peers - connect to each
           const myId = myPeerIdRef.current
           data.peers.forEach(peerId => {
             if (peerId !== myId && !connectionsRef.current[peerId]) {
@@ -151,6 +150,56 @@ export default function MeetingRoom() {
     })
   }, [callPeer])
 
+  // Setup host listeners
+  const setupHostListeners = useCallback((peer) => {
+    peer.on('connection', (newConn) => {
+      newConn.on('open', () => {
+        const peerName = newConn.metadata?.displayName || 'Guest'
+        const remotePeerId = newConn.peer
+
+        connectionsRef.current[remotePeerId] = newConn
+        setParticipants(prev => {
+          if (prev.find(p => p.id === remotePeerId)) return prev
+          return [...prev, { id: remotePeerId, displayName: peerName }]
+        })
+        setParticipantCount(prev => prev + 1)
+        showNotif(`${peerName} joined`, 'info')
+
+        // Send welcome with existing peers
+        const existingPeers = Object.keys(connectionsRef.current)
+        newConn.send({ type: 'welcome', peers: existingPeers })
+
+        // Notify existing peers
+        Object.entries(connectionsRef.current).forEach(([id, c]) => {
+          if (id !== remotePeerId && c.open) {
+            c.send({ type: 'new-peer', peerId: remotePeerId, displayName: peerName })
+          }
+        })
+
+        callPeer(remotePeerId)
+        setupDataHandlers(newConn, remotePeerId)
+      })
+    })
+
+    peer.on('call', (call) => {
+      call.answer(localStreamRef.current)
+      call.on('stream', (remoteStream) => {
+        const peerId = call.peer
+        let video = document.getElementById(`remote-${peerId}`)
+        if (!video) {
+          video = document.createElement('video')
+          video.id = `remote-${peerId}`
+          video.autoplay = true
+          video.playsInline = true
+          video.className = 'remote-video'
+          const container = document.getElementById('remote-videos')
+          if (container) container.appendChild(video)
+        }
+        video.srcObject = remoteStream
+      })
+    })
+  }, [callPeer, setupDataHandlers, showNotif])
+
   // Initialize
   useEffect(() => {
     if (!meetingId) return
@@ -159,7 +208,6 @@ export default function MeetingRoom() {
     setDisplayName(name)
 
     const init = async () => {
-      // Get local stream
       let stream
       try {
         stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true })
@@ -168,144 +216,106 @@ export default function MeetingRoom() {
           stream = await navigator.mediaDevices.getUserMedia({ audio: true })
           setVideoEnabled(false)
         } catch {
-          showNotif('Could not access camera or microphone', 'error')
+          showNotif('Could not access camera/mic', 'error')
           return
         }
       }
       localStreamRef.current = stream
       if (localVideoRef.current) localVideoRef.current.srcObject = stream
 
-      // Create a unique peer ID for THIS user
-      const myPeerId = `user-${meetingId}-${Date.now()}-${Math.random().toString(36).substr(2, 5)}`
-      myPeerIdRef.current = myPeerId
-
       const hostPeerId = `host-${meetingId}`
 
-      const peer = new Peer(myPeerId, {
-        host: '0.peerjs.com',
-        port: 443,
-        path: '/',
-        debug: 0,
-      })
-      peerRef.current = peer
+      // Try to become host FIRST (fast path)
+      const tryHost = () => {
+        return new Promise((resolve) => {
+          const peer = new Peer(hostPeerId, {
+            host: '0.peerjs.com', port: 443, path: '/', debug: 0,
+          })
 
-      peer.on('open', () => {
+          peer.on('open', () => {
+            // We ARE the host!
+            resolve({ success: true, peer })
+          })
+
+          peer.on('error', (err) => {
+            if (err.type === 'unavailable-id') {
+              // ID taken - someone else is host
+              peer.destroy()
+              resolve({ success: false, peer: null })
+            } else {
+              console.error('Host peer error:', err)
+            }
+          })
+        })
+      }
+
+      const result = await tryHost()
+
+      if (result.success) {
+        // WE ARE THE HOST
+        peerRef.current = result.peer
+        myPeerIdRef.current = hostPeerId
+        isHostRef.current = true
         setConnected(true)
-        // Try to connect to the host
-        const conn = peer.connect(hostPeerId, {
-          metadata: { displayName: name },
-          reliable: true,
+        setIsHost(true)
+        setMeetingJoined(true)
+        setParticipantCount(1)
+        setupHostListeners(result.peer)
+        showNotif('You are the host!', 'success')
+      } else {
+        // WE ARE A GUEST - create random ID and connect to host
+        const guestId = `guest-${meetingId}-${Date.now()}-${Math.random().toString(36).substr(2, 5)}`
+        myPeerIdRef.current = guestId
+
+        const peer = new Peer(guestId, {
+          host: '0.peerjs.com', port: 443, path: '/', debug: 0,
+        })
+        peerRef.current = peer
+
+        peer.on('open', () => {
+          setConnected(true)
+          const conn = peer.connect(hostPeerId, {
+            metadata: { displayName: name },
+            reliable: true,
+          })
+
+          conn.on('open', () => {
+            setIsHost(false)
+            setMeetingJoined(true)
+            connectionsRef.current[hostPeerId] = conn
+            setupDataHandlers(conn, hostPeerId)
+            showNotif('Connected to meeting!', 'success')
+          })
+
+          conn.on('error', (err) => {
+            console.error('Connection error:', err)
+            showNotif('Failed to connect to host', 'error')
+          })
         })
 
-        let isHost = false
-
-        conn.on('open', () => {
-          // We connected to host - we are a GUEST
-          isHost = false
-          setIsHost(false)
-          setMeetingJoined(true)
-          connectionsRef.current['host'] = conn
-          setupDataHandlers(conn, 'host')
-          showNotif('Connected to meeting!', 'success')
+        // Handle incoming calls as guest
+        peer.on('call', (call) => {
+          call.answer(localStreamRef.current)
+          call.on('stream', (remoteStream) => {
+            const peerId = call.peer
+            let video = document.getElementById(`remote-${peerId}`)
+            if (!video) {
+              video = document.createElement('video')
+              video.id = `remote-${peerId}`
+              video.autoplay = true
+              video.playsInline = true
+              video.className = 'remote-video'
+              const container = document.getElementById('remote-videos')
+              if (container) container.appendChild(video)
+            }
+            video.srcObject = remoteStream
+          })
         })
 
-        // If connection to host fails - we ARE the host
-        setTimeout(() => {
-          if (!isHost && !connectionsRef.current['host']) {
-            // Destroy and recreate with host ID
-            peer.destroy()
-            const hostPeer = new Peer(hostPeerId, {
-              host: '0.peerjs.com',
-              port: 443,
-              path: '/',
-              debug: 0,
-            })
-            peerRef.current = hostPeer
-            myPeerIdRef.current = hostPeerId
-
-            hostPeer.on('open', () => {
-              setIsHost(true)
-              setMeetingJoined(true)
-              setParticipantCount(1)
-              showNotif('You are the host! Others can now join.', 'success')
-            })
-
-            hostPeer.on('connection', (newConn) => {
-              newConn.on('open', () => {
-                const peerName = newConn.metadata?.displayName || 'Guest'
-                const remotePeerId = newConn.peer
-
-                connectionsRef.current[remotePeerId] = newConn
-                setParticipants(prev => {
-                  if (prev.find(p => p.id === remotePeerId)) return prev
-                  return [...prev, { id: remotePeerId, displayName: peerName }]
-                })
-                setParticipantCount(prev => prev + 1)
-                showNotif(`${peerName} joined the meeting`, 'info')
-
-                // Send welcome message with all existing peers
-                const existingPeers = Object.keys(connectionsRef.current)
-                newConn.send({ type: 'welcome', peers: existingPeers })
-
-                // Notify all existing peers about the new peer
-                Object.entries(connectionsRef.current).forEach(([id, c]) => {
-                  if (id !== remotePeerId && id !== 'host' && c.open) {
-                    c.send({ type: 'new-peer', peerId: remotePeerId, displayName: peerName })
-                  }
-                })
-
-                // Call the new peer for video
-                callPeer(remotePeerId)
-
-                // Handle data from this peer
-                setupDataHandlers(newConn, remotePeerId)
-              })
-            })
-
-            // Handle incoming calls as host
-            hostPeer.on('call', (call) => {
-              call.answer(localStreamRef.current)
-              call.on('stream', (remoteStream) => {
-                const peerId = call.peer
-                let video = document.getElementById(`remote-${peerId}`)
-                if (!video) {
-                  video = document.createElement('video')
-                  video.id = `remote-${peerId}`
-                  video.autoplay = true
-                  video.playsInline = true
-                  video.className = 'remote-video'
-                  const container = document.getElementById('remote-videos')
-                  if (container) container.appendChild(video)
-                }
-                video.srcObject = remoteStream
-              })
-            })
-          }
-        }, 2000)
-      })
-
-      peer.on('error', (err) => {
-        console.error('PeerJS error:', err)
-      })
-
-      // Handle incoming calls as guest
-      peer.on('call', (call) => {
-        call.answer(localStreamRef.current)
-        call.on('stream', (remoteStream) => {
-          const peerId = call.peer
-          let video = document.getElementById(`remote-${peerId}`)
-          if (!video) {
-            video = document.createElement('video')
-            video.id = `remote-${peerId}`
-            video.autoplay = true
-            video.playsInline = true
-            video.className = 'remote-video'
-            const container = document.getElementById('remote-videos')
-            if (container) container.appendChild(video)
-          }
-          video.srcObject = remoteStream
+        peer.on('error', (err) => {
+          console.error('Guest peer error:', err)
         })
-      })
+      }
     }
 
     init()
@@ -324,12 +334,10 @@ export default function MeetingRoom() {
     }
   }, [meetingJoined])
 
-  // Auto-scroll chat
   useEffect(() => {
     chatEndRef.current?.scrollIntoView({ behavior: 'smooth' })
   }, [chatMessages])
 
-  // Keyboard shortcuts
   useEffect(() => {
     const handleKey = (e) => {
       if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') return

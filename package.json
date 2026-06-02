@@ -9,10 +9,9 @@
   },
   "dependencies": {
     "next": "^13.0.0",
+    "peerjs": "^1.5.5",
     "react": "^18.0.0",
     "react-dom": "^18.0.0",
-    "peerjs": "^1.5.4",
     "uuid": "^9.0.0"
-  },
-  "devDependencies": {}
+  }
 }
