@@ -43,7 +43,7 @@ export default function MeetingRoom() {
   const screenStreamRef = useRef(null)
   const peerRef = useRef(null)
   const connectionsRef = useRef({})
-  const remoteVideosRef = useRef({})
+  const myPeerIdRef = useRef(null)
   const chatEndRef = useRef(null)
   const timerRef = useRef(null)
 
@@ -55,7 +55,7 @@ export default function MeetingRoom() {
   const formatTime = (s) => {
     const m = Math.floor(s / 60)
     const sec = s % 60
-    return `${String(m).padStart(2,'0')}:${String(sec).padStart(2,'0')}`
+    return `${String(m).padStart(2, '0')}:${String(sec).padStart(2, '0')}`
   }
 
   const copyMeetingLink = () => {
@@ -64,7 +64,94 @@ export default function MeetingRoom() {
     setTimeout(() => setCopied(false), 2000)
   }
 
-  // Initialize peer and stream
+  const broadcast = useCallback((data) => {
+    Object.values(connectionsRef.current).forEach(conn => {
+      if (conn.open) conn.send(data)
+    })
+  }, [])
+
+  const callPeer = useCallback((peerId) => {
+    if (!peerRef.current || !localStreamRef.current) return
+    const call = peerRef.current.call(peerId, localStreamRef.current)
+    if (!call) return
+    call.on('stream', (remoteStream) => {
+      let video = document.getElementById(`remote-${peerId}`)
+      if (!video) {
+        video = document.createElement('video')
+        video.id = `remote-${peerId}`
+        video.autoplay = true
+        video.playsInline = true
+        video.className = 'remote-video'
+        const container = document.getElementById('remote-videos')
+        if (container) container.appendChild(video)
+      }
+      video.srcObject = remoteStream
+    })
+  }, [])
+
+  const setupDataHandlers = useCallback((conn, remotePeerId) => {
+    conn.on('data', (data) => {
+      switch (data.type) {
+        case 'chat':
+          setChatMessages(prev => [...prev, {
+            from: remotePeerId, displayName: data.displayName,
+            message: data.message, timestamp: new Date().toISOString(), isLocal: false,
+          }])
+          break
+        case 'reaction': {
+          const id = Date.now() + Math.random()
+          setReactions(prev => [...prev, { id, emoji: data.emoji, from: data.displayName }])
+          setTimeout(() => setReactions(prev => prev.filter(r => r.id !== id)), 3000)
+          break
+        }
+        case 'hand-raise':
+          setParticipants(prev => prev.map(p =>
+            p.id === remotePeerId ? { ...p, handRaised: data.raised } : p
+          ))
+          break
+        case 'media-change':
+          setParticipants(prev => prev.map(p =>
+            p.id === remotePeerId ? { ...p, audioMuted: data.audio === false, videoOff: data.video === false } : p
+          ))
+          break
+        case 'welcome': {
+          // Host sent us the list of existing peers - connect to each
+          const myId = myPeerIdRef.current
+          data.peers.forEach(peerId => {
+            if (peerId !== myId && !connectionsRef.current[peerId]) {
+              const newConn = peerRef.current.connect(peerId, {
+                metadata: { displayName: localStorage.getItem('displayName') || 'Guest' },
+                reliable: true,
+              })
+              newConn.on('open', () => {
+                connectionsRef.current[peerId] = newConn
+                setupDataHandlers(newConn, peerId)
+                callPeer(peerId)
+              })
+            }
+          })
+          break
+        }
+        case 'new-peer': {
+          const myId = myPeerIdRef.current
+          if (data.peerId !== myId && !connectionsRef.current[data.peerId]) {
+            const newConn = peerRef.current.connect(data.peerId, {
+              metadata: { displayName: localStorage.getItem('displayName') || 'Guest' },
+              reliable: true,
+            })
+            newConn.on('open', () => {
+              connectionsRef.current[data.peerId] = newConn
+              setupDataHandlers(newConn, data.peerId)
+              callPeer(data.peerId)
+            })
+          }
+          break
+        }
+      }
+    })
+  }, [callPeer])
+
+  // Initialize
   useEffect(() => {
     if (!meetingId) return
 
@@ -88,9 +175,13 @@ export default function MeetingRoom() {
       localStreamRef.current = stream
       if (localVideoRef.current) localVideoRef.current.srcObject = stream
 
-      // Create PeerJS peer
-      const peerId = `${meetingId}-${Date.now()}-${Math.random().toString(36).substr(2, 5)}`
-      const peer = new Peer(peerId, {
+      // Create a unique peer ID for THIS user
+      const myPeerId = `user-${meetingId}-${Date.now()}-${Math.random().toString(36).substr(2, 5)}`
+      myPeerIdRef.current = myPeerId
+
+      const hostPeerId = `host-${meetingId}`
+
+      const peer = new Peer(myPeerId, {
         host: '0.peerjs.com',
         port: 443,
         path: '/',
@@ -98,68 +189,122 @@ export default function MeetingRoom() {
       })
       peerRef.current = peer
 
-      peer.on('open', (id) => {
+      peer.on('open', () => {
         setConnected(true)
-        setMeetingJoined(true)
-        setIsHost(true)
-        showNotif('Connected! Share the meeting link to invite others.', 'success')
+        // Try to connect to the host
+        const conn = peer.connect(hostPeerId, {
+          metadata: { displayName: name },
+          reliable: true,
+        })
+
+        let isHost = false
+
+        conn.on('open', () => {
+          // We connected to host - we are a GUEST
+          isHost = false
+          setIsHost(false)
+          setMeetingJoined(true)
+          connectionsRef.current['host'] = conn
+          setupDataHandlers(conn, 'host')
+          showNotif('Connected to meeting!', 'success')
+        })
+
+        // If connection to host fails - we ARE the host
+        setTimeout(() => {
+          if (!isHost && !connectionsRef.current['host']) {
+            // Destroy and recreate with host ID
+            peer.destroy()
+            const hostPeer = new Peer(hostPeerId, {
+              host: '0.peerjs.com',
+              port: 443,
+              path: '/',
+              debug: 0,
+            })
+            peerRef.current = hostPeer
+            myPeerIdRef.current = hostPeerId
+
+            hostPeer.on('open', () => {
+              setIsHost(true)
+              setMeetingJoined(true)
+              setParticipantCount(1)
+              showNotif('You are the host! Others can now join.', 'success')
+            })
+
+            hostPeer.on('connection', (newConn) => {
+              newConn.on('open', () => {
+                const peerName = newConn.metadata?.displayName || 'Guest'
+                const remotePeerId = newConn.peer
+
+                connectionsRef.current[remotePeerId] = newConn
+                setParticipants(prev => {
+                  if (prev.find(p => p.id === remotePeerId)) return prev
+                  return [...prev, { id: remotePeerId, displayName: peerName }]
+                })
+                setParticipantCount(prev => prev + 1)
+                showNotif(`${peerName} joined the meeting`, 'info')
+
+                // Send welcome message with all existing peers
+                const existingPeers = Object.keys(connectionsRef.current)
+                newConn.send({ type: 'welcome', peers: existingPeers })
+
+                // Notify all existing peers about the new peer
+                Object.entries(connectionsRef.current).forEach(([id, c]) => {
+                  if (id !== remotePeerId && id !== 'host' && c.open) {
+                    c.send({ type: 'new-peer', peerId: remotePeerId, displayName: peerName })
+                  }
+                })
+
+                // Call the new peer for video
+                callPeer(remotePeerId)
+
+                // Handle data from this peer
+                setupDataHandlers(newConn, remotePeerId)
+              })
+            })
+
+            // Handle incoming calls as host
+            hostPeer.on('call', (call) => {
+              call.answer(localStreamRef.current)
+              call.on('stream', (remoteStream) => {
+                const peerId = call.peer
+                let video = document.getElementById(`remote-${peerId}`)
+                if (!video) {
+                  video = document.createElement('video')
+                  video.id = `remote-${peerId}`
+                  video.autoplay = true
+                  video.playsInline = true
+                  video.className = 'remote-video'
+                  const container = document.getElementById('remote-videos')
+                  if (container) container.appendChild(video)
+                }
+                video.srcObject = remoteStream
+              })
+            })
+          }
+        }, 2000)
       })
 
       peer.on('error', (err) => {
         console.error('PeerJS error:', err)
-        if (err.type === 'unavailable-id') {
-          setJoinError('Meeting is full or already exists')
-        }
       })
 
-      // Handle incoming connections (new participant)
-      peer.on('connection', (conn) => {
-        conn.on('open', () => {
-          const peerName = conn.metadata?.displayName || 'Guest'
-          const remotePeerId = conn.peer
-
-          connectionsRef.current[remotePeerId] = conn
-          setParticipants(prev => {
-            const exists = prev.find(p => p.id === remotePeerId)
-            if (exists) return prev
-            return [...prev, { id: remotePeerId, displayName: peerName }]
-          })
-          setParticipantCount(prev => prev + 1)
-          showNotif(`${peerName} joined`, 'info')
-
-          // Send existing participants list to new peer
-          const existingPeers = Object.keys(connectionsRef.current)
-          conn.send({ type: 'peers-list', peers: existingPeers, hostName: name })
-
-          // Tell existing peers about the new peer
-          Object.entries(connectionsRef.current).forEach(([id, c]) => {
-            if (id !== remotePeerId && c.open) {
-              c.send({ type: 'new-peer', peerId: remotePeerId, displayName: peerName })
-            }
-          })
-
-          // Set up chat and data handlers
-          setupDataHandlers(conn, remotePeerId)
+      // Handle incoming calls as guest
+      peer.on('call', (call) => {
+        call.answer(localStreamRef.current)
+        call.on('stream', (remoteStream) => {
+          const peerId = call.peer
+          let video = document.getElementById(`remote-${peerId}`)
+          if (!video) {
+            video = document.createElement('video')
+            video.id = `remote-${peerId}`
+            video.autoplay = true
+            video.playsInline = true
+            video.className = 'remote-video'
+            const container = document.getElementById('remote-videos')
+            if (container) container.appendChild(video)
+          }
+          video.srcObject = remoteStream
         })
-      })
-
-      // If host exists, connect to host
-      const hostPeerId = meetingId
-      const conn = peer.connect(hostPeerId, {
-        metadata: { displayName: name },
-        reliable: true,
-      })
-
-      conn.on('open', () => {
-        setIsHost(false)
-        connectionsRef.current['host'] = conn
-        setupDataHandlers(conn, 'host')
-      })
-
-      conn.on('error', () => {
-        // No host found - we are the host
-        setIsHost(true)
-        showNotif('You are the first participant (Host)', 'info')
       })
     }
 
@@ -168,117 +313,8 @@ export default function MeetingRoom() {
     return () => {
       if (peerRef.current) peerRef.current.destroy()
       if (localStreamRef.current) localStreamRef.current.getTracks().forEach(t => t.stop())
-      if (screenStreamRef.current) screenStreamRef.current.getTracks().forEach(t => t.stop())
     }
   }, [meetingId])
-
-  // Setup data handlers for a connection
-  const setupDataHandlers = useCallback((conn, remotePeerId) => {
-    conn.on('data', (data) => {
-      switch (data.type) {
-        case 'chat':
-          setChatMessages(prev => [...prev, {
-            from: remotePeerId,
-            displayName: data.displayName,
-            message: data.message,
-            timestamp: new Date().toISOString(),
-            isLocal: false,
-          }])
-          break
-        case 'reaction': {
-          const id = Date.now() + Math.random()
-          setReactions(prev => [...prev, { id, emoji: data.emoji, from: data.displayName }])
-          setTimeout(() => setReactions(prev => prev.filter(r => r.id !== id)), 3000)
-          break
-        }
-        case 'hand-raise':
-          setParticipants(prev => prev.map(p =>
-            p.id === remotePeerId ? { ...p, handRaised: data.raised } : p
-          ))
-          break
-        case 'media-change':
-          setParticipants(prev => prev.map(p =>
-            p.id === remotePeerId ? { ...p, audioMuted: data.audio === false, videoOff: data.video === false } : p
-          ))
-          break
-        case 'peers-list':
-          // Connect to all existing peers
-          data.peers.forEach(peerId => {
-            if (!connectionsRef.current[peerId]) {
-              const newConn = conn.peer.connect(peerId, {
-                metadata: { displayName: localStorage.getItem('displayName') || 'Guest' },
-                reliable: true,
-              })
-              newConn.on('open', () => {
-                connectionsRef.current[peerId] = newConn
-                setupDataHandlers(newConn, peerId)
-                // Call the peer for video
-                callPeer(peerId)
-              })
-            }
-          })
-          break
-        case 'new-peer':
-          // A new peer joined - connect to them
-          if (!connectionsRef.current[data.peerId]) {
-            const newConn = conn.peer.connect(data.peerId, {
-              metadata: { displayName: localStorage.getItem('displayName') || 'Guest' },
-              reliable: true,
-            })
-            newConn.on('open', () => {
-              connectionsRef.current[data.peerId] = newConn
-              setupDataHandlers(newConn, data.peerId)
-            })
-          }
-          break
-      }
-    })
-  }, [])
-
-  // Call a peer for video
-  const callPeer = useCallback((peerId) => {
-    if (!peerRef.current || !localStreamRef.current) return
-
-    const call = peerRef.current.call(peerId, localStreamRef.current)
-    if (!call) return
-
-    call.on('stream', (remoteStream) => {
-      let video = document.getElementById(`remote-${peerId}`)
-      if (!video) {
-        video = document.createElement('video')
-        video.id = `remote-${peerId}`
-        video.autoplay = true
-        video.playsInline = true
-        video.className = 'remote-video'
-        const container = document.getElementById('remote-videos')
-        if (container) container.appendChild(video)
-      }
-      video.srcObject = remoteStream
-    })
-  }, [])
-
-  // Handle incoming calls
-  useEffect(() => {
-    if (!peerRef.current) return
-
-    peerRef.current.on('call', (call) => {
-      call.answer(localStreamRef.current)
-      call.on('stream', (remoteStream) => {
-        const peerId = call.peer
-        let video = document.getElementById(`remote-${peerId}`)
-        if (!video) {
-          video = document.createElement('video')
-          video.id = `remote-${peerId}`
-          video.autoplay = true
-          video.playsInline = true
-          video.className = 'remote-video'
-          const container = document.getElementById('remote-videos')
-          if (container) container.appendChild(video)
-        }
-        video.srcObject = remoteStream
-      })
-    })
-  }, [peerRef.current])
 
   // Timer
   useEffect(() => {
@@ -297,7 +333,7 @@ export default function MeetingRoom() {
   useEffect(() => {
     const handleKey = (e) => {
       if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') return
-      switch(e.key.toLowerCase()) {
+      switch (e.key.toLowerCase()) {
         case 'm': toggleAudio(); break
         case 'v': toggleVideo(); break
         case 'h': toggleHand(); break
@@ -309,12 +345,6 @@ export default function MeetingRoom() {
     window.addEventListener('keydown', handleKey)
     return () => window.removeEventListener('keydown', handleKey)
   }, [audioEnabled, videoEnabled, handRaised])
-
-  const broadcast = (data) => {
-    Object.values(connectionsRef.current).forEach(conn => {
-      if (conn.open) conn.send(data)
-    })
-  }
 
   const toggleAudio = () => {
     if (localStreamRef.current) {
@@ -343,24 +373,22 @@ export default function MeetingRoom() {
       try {
         const stream = await navigator.mediaDevices.getDisplayMedia({ video: true })
         screenStreamRef.current = stream
-        const screenTrack = stream.getVideoTracks()[0]
-        screenTrack.onended = () => stopScreenShare()
+        stream.getVideoTracks()[0].onended = () => {
+          screenStreamRef.current = null
+          setScreenSharing(false)
+        }
         setScreenSharing(true)
         showNotif('Screen sharing started', 'success')
       } catch {
         showNotif('Failed to share screen', 'error')
       }
     } else {
-      stopScreenShare()
+      if (screenStreamRef.current) {
+        screenStreamRef.current.getTracks().forEach(t => t.stop())
+        screenStreamRef.current = null
+      }
+      setScreenSharing(false)
     }
-  }
-
-  const stopScreenShare = () => {
-    if (screenStreamRef.current) {
-      screenStreamRef.current.getTracks().forEach(t => t.stop())
-      screenStreamRef.current = null
-    }
-    setScreenSharing(false)
   }
 
   const toggleHand = () => {
@@ -394,7 +422,6 @@ export default function MeetingRoom() {
     router.push('/')
   }
 
-  // Waiting room / ended screens
   if (joinError) {
     return (
       <div className="waiting-room-screen">
@@ -415,6 +442,7 @@ export default function MeetingRoom() {
         <div className="waiting-room-content">
           <div className="loading-spinner"></div>
           <h1>Joining Meeting...</h1>
+          <p style={{ color: '#aaa', marginTop: '10px' }}>Connecting to {meetingId}</p>
         </div>
       </div>
     )
@@ -422,9 +450,7 @@ export default function MeetingRoom() {
 
   return (
     <div className="meeting-container">
-      <Head>
-        <title>Meeting - {meetingId}</title>
-      </Head>
+      <Head><title>Meeting - {meetingId}</title></Head>
 
       {notification && (
         <div className={`notification notification-${notification.type}`}>{notification.msg}</div>
@@ -459,10 +485,8 @@ export default function MeetingRoom() {
         <div className="local-video-wrapper">
           <video ref={localVideoRef} autoPlay playsInline muted className="local-video" />
           <div className="video-label">
-            {displayName} (You)
-            {handRaised && ' ✋'}
-            {!audioEnabled && ' 🔇'}
-            {!videoEnabled && ' 📷'}
+            {displayName} (You) {handRaised && ' ✋'}
+            {!audioEnabled && ' 🔇'} {!videoEnabled && ' 📷'}
           </div>
         </div>
         <div className="remote-videos" id="remote-videos"></div>
@@ -479,9 +503,7 @@ export default function MeetingRoom() {
           <button className={`ctrl-btn ${!videoEnabled ? 'off' : ''}`} onClick={toggleVideo}>
             {videoEnabled ? '📹' : '📷'}
           </button>
-          <button className={`ctrl-btn ${screenSharing ? 'sharing' : ''}`} onClick={toggleScreenShare}>
-            🖥️
-          </button>
+          <button className={`ctrl-btn ${screenSharing ? 'sharing' : ''}`} onClick={toggleScreenShare}>🖥️</button>
           <button className={`ctrl-btn ${handRaised ? 'raised' : ''}`} onClick={toggleHand}>✋</button>
           <button className="ctrl-btn" onClick={() => setShowReactionPicker(!showReactionPicker)}>👋</button>
           {showReactionPicker && (
