@@ -1,6 +1,7 @@
 import Head from 'next/head'
 import { useState } from 'react'
 import { useRouter } from 'next/router'
+import { v4 as uuidv4 } from 'uuid'
 
 export async function getServerSideProps() {
   return { props: {} }
@@ -8,69 +9,27 @@ export async function getServerSideProps() {
 
 export default function Home() {
   const [meetingId, setMeetingId] = useState('')
-  const [password, setPassword] = useState('')
   const [displayName, setDisplayName] = useState('')
   const [showCreateModal, setShowCreateModal] = useState(false)
-  const [showJoinModal, setShowJoinModal] = useState(false)
   const [showSettingsModal, setShowSettingsModal] = useState(false)
-  const [createPassword, setCreatePassword] = useState('')
-  const [waitingRoom, setWaitingRoom] = useState(true)
   const [error, setError] = useState('')
-  const [loading, setLoading] = useState(false)
   const [micEnabled, setMicEnabled] = useState(true)
   const [camEnabled, setCamEnabled] = useState(true)
   const router = useRouter()
 
-  const SIGNALING_SERVER = process.env.NEXT_PUBLIC_SIGNALING_SERVER || process.env.VERCEL_URL ? '' : ''
-
-  const createMeeting = async () => {
-    setLoading(true)
-    setError('')
-    try {
-      const res = await fetch(`/api/create-meeting`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ password: createPassword, waitingRoom })
-      })
-      const data = await res.json()
-      if (data.success) {
-        localStorage.setItem('displayName', displayName || 'Host')
-        router.push(`/meeting/${data.meetingId}`)
-      } else {
-        setError('Failed to create meeting. Please try again.')
-      }
-    } catch (err) {
-      setError('Failed to connect to server. Please try again.')
-      setLoading(false)
-    }
+  const createMeeting = () => {
+    const id = uuidv4().slice(0, 8)
+    localStorage.setItem('displayName', displayName || 'Host')
+    router.push(`/meeting/${id}`)
   }
 
-  const joinMeeting = async () => {
+  const joinMeeting = () => {
     if (!meetingId.trim()) {
       setError('Please enter a meeting ID')
       return
     }
-    setLoading(true)
-    setError('')
-    try {
-      const res = await fetch(`/api/check-meeting/${meetingId.trim()}`)
-      const data = await res.json()
-      if (data.exists) {
-        localStorage.setItem('displayName', displayName || 'Guest')
-        router.push(`/meeting/${meetingId.trim()}`)
-      } else {
-        setError('Meeting not found. Please check the ID and try again.')
-        setLoading(false)
-      }
-    } catch (err) {
-      setError('Failed to connect to server. Please try again.')
-      setLoading(false)
-    }
-  }
-
-  const quickStart = () => {
-    localStorage.setItem('displayName', displayName || 'Host')
-    setShowCreateModal(true)
+    localStorage.setItem('displayName', displayName || 'Guest')
+    router.push(`/meeting/${meetingId.trim()}`)
   }
 
   return (
@@ -81,7 +40,6 @@ export default function Home() {
         <meta name="viewport" content="width=device-width, initial-scale=1" />
       </Head>
 
-      {/* Error Toast */}
       {error && (
         <div className="error-toast" onClick={() => setError('')}>
           <div className="error-title">Error</div>
@@ -90,7 +48,6 @@ export default function Home() {
         </div>
       )}
 
-      {/* Header */}
       <header className="home-header">
         <div className="logo">
           <span className="logo-icon">📹</span>
@@ -112,7 +69,6 @@ export default function Home() {
           </p>
         </div>
 
-        {/* Pre-join Camera Preview */}
         <div className="preview-section">
           <div className="preview-card">
             <div className="preview-video">
@@ -125,7 +81,6 @@ export default function Home() {
               <button
                 className={`preview-ctrl ${micEnabled ? 'active' : 'off'}`}
                 onClick={() => setMicEnabled(!micEnabled)}
-                title={micEnabled ? 'Mute Microphone' : 'Unmute Microphone'}
               >
                 {micEnabled ? '🎤' : '🔇'}
               </button>
@@ -139,7 +94,6 @@ export default function Home() {
               <button
                 className={`preview-ctrl ${camEnabled ? 'active' : 'off'}`}
                 onClick={() => setCamEnabled(!camEnabled)}
-                title={camEnabled ? 'Turn Off Camera' : 'Turn On Camera'}
               >
                 {camEnabled ? '📹' : '📷'}
               </button>
@@ -147,17 +101,14 @@ export default function Home() {
           </div>
         </div>
 
-        {/* Action Cards */}
         <div className="action-cards">
-          {/* Create Meeting Card */}
-          <div className="action-card create-card" onClick={() => setShowCreateModal(true)}>
+          <div className="action-card create-card" onClick={createMeeting}>
             <div className="card-icon">➕</div>
             <h3>New Meeting</h3>
             <p>Create an instant meeting and invite others</p>
             <button className="card-btn create">Create Meeting</button>
           </div>
 
-          {/* Join Meeting Card */}
           <div className="action-card join-card">
             <div className="card-icon">🔗</div>
             <h3>Join Meeting</h3>
@@ -171,26 +122,18 @@ export default function Home() {
                 onKeyPress={(e) => e.key === 'Enter' && joinMeeting()}
                 className="join-input"
               />
-              <button
-                className="card-btn join"
-                onClick={joinMeeting}
-                disabled={loading}
-              >
-                Join
-              </button>
+              <button className="card-btn join" onClick={joinMeeting}>Join</button>
             </div>
           </div>
 
-          {/* Schedule Card */}
           <div className="action-card schedule-card">
             <div className="card-icon">📅</div>
             <h3>Schedule</h3>
             <p>Plan ahead and schedule a meeting</p>
-            <button className="card-btn schedule">Schedule Meeting</button>
+            <button className="card-btn schedule" onClick={createMeeting}>Schedule Meeting</button>
           </div>
         </div>
 
-        {/* Features Section */}
         <div className="features-section">
           <h2 className="features-title">Everything You Need</h2>
           <div className="features-grid">
@@ -227,19 +170,17 @@ export default function Home() {
           </div>
         </div>
 
-        {/* Footer */}
         <footer className="home-footer">
-          <p>&copy; 2024 MeetNow. Built with ❤️ | @copyrit-e-n-g-Ahmed-Nabil@</p>
+          <p>&copy; 2024 MeetNow. Built with ❤️</p>
         </footer>
       </main>
 
-      {/* ===== CREATE MEETING MODAL ===== */}
       {showCreateModal && (
-        <div className="modal-overlay" onClick={() => { setShowCreateModal(false); setLoading(false); }}>
+        <div className="modal-overlay" onClick={() => setShowCreateModal(false)}>
           <div className="modal" onClick={(e) => e.stopPropagation()}>
             <div className="modal-header">
               <h2>Create a New Meeting</h2>
-              <button className="modal-close" onClick={() => { setShowCreateModal(false); setLoading(false); }}>&times;</button>
+              <button className="modal-close" onClick={() => setShowCreateModal(false)}>&times;</button>
             </div>
             <div className="modal-body">
               <div className="form-group">
@@ -251,28 +192,6 @@ export default function Home() {
                   onChange={(e) => setDisplayName(e.target.value)}
                   className="form-input"
                 />
-              </div>
-              <div className="form-group">
-                <label>Meeting Password (optional)</label>
-                <input
-                  type="password"
-                  placeholder="Leave empty for no password"
-                  value={createPassword}
-                  onChange={(e) => setCreatePassword(e.target.value)}
-                  className="form-input"
-                />
-              </div>
-              <div className="form-group checkbox-group">
-                <label className="checkbox-label">
-                  <input
-                    type="checkbox"
-                    checked={waitingRoom}
-                    onChange={(e) => setWaitingRoom(e.target.checked)}
-                  />
-                  <span className="checkmark"></span>
-                  <span>Enable Waiting Room</span>
-                </label>
-                <span className="form-hint">Participants will wait for host approval before joining</span>
               </div>
               <div className="modal-preview-controls">
                 <button
@@ -290,19 +209,12 @@ export default function Home() {
               </div>
             </div>
             <div className="modal-footer">
-              <button
-                className="btn-primary"
-                onClick={createMeeting}
-                disabled={loading}
-              >
-                {loading ? 'Creating...' : 'Join Meeting'}
-              </button>
+              <button className="btn-primary" onClick={createMeeting}>Join Meeting</button>
             </div>
           </div>
         </div>
       )}
 
-      {/* ===== SETTINGS MODAL ===== */}
       {showSettingsModal && (
         <div className="modal-overlay" onClick={() => setShowSettingsModal(false)}>
           <div className="modal" onClick={(e) => e.stopPropagation()}>
